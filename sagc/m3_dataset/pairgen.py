@@ -1,0 +1,275 @@
+"""M3: the pairwise co-location dataset.
+
+Produces `pairs.parquet`, the central empirical artefact of the project and the
+thing of most value to other researchers.
+
+MEASUREMENT PROTOCOL
+--------------------
+For each pairing, each MPS thread-percentage setting, and each repetition:
+
+  1. Re-measure the SOLO baseline for both tenants *in the current session*.
+     Not optional. Clock behaviour on a shared cloud GPU varies between
+     sessions, so a slowdown computed against yesterday's baseline is noise
+     dressed up as a result. Solo baselines are cached per session and re-taken
+     when the session identifier changes.
+  2. Launch both tenants as concurrent processes with a shared scheduled start
+     so their timed regions overlap.
+  3. Record slowdown = co-located wall time / solo wall time, for each tenant
+     independently. The two are different numbers; that asymmetry is the signal
+     the predictor is trained on.
+  4. Treat VRAM exhaustion as a LABELLED OUTCOME (`oom=True`), never as a crash
+     to be retried. Which pairs cannot co-reside is information the scheduler
+     needs.
+
+Each measured pair yields TWO training rows by exchanging tenant roles.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+from ..common import env, provenance
+from ..m2_profiler import runner as runner_mod
+from ..m2_profiler import signature as sig_mod
+from ..workloads import interference, registry
+from . import mps as mps_mod
+
+DEFAULT_THREAD_PCTS = [100, 50]
+DEFAULT_REPS = 3
+LAUNCH_LEAD_SECONDS = 6.0      # time allowed for both workers to warm up
+
+
+@dataclass
+class SweepConfig:
+    thread_pcts: List[int] = field(default_factory=lambda: list(DEFAULT_THREAD_PCTS))
+    reps: int = DEFAULT_REPS
+    device_index: int = 0
+    interval_ms: int = 100
+    include_self_pairs: bool = True
+    workloads: Optional[List[str]] = None
+    session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+
+    def pairs(self) -> List[Tuple[str, str]]:
+        return registry.unordered_pairs(self.workloads, self.include_self_pairs)
+
+    def n_runs(self) -> int:
+        return len(self.pairs()) * len(self.thread_pcts) * self.reps
+
+    def estimate_gpu_hours(self) -> float:
+        """Measurement budget: the number that decides whether this is feasible."""
+        names = self.workloads or registry.zoo_names()
+        mean_solo = float(np.mean([registry.get(n).sim_solo_seconds for n in names]))
+        setup = 10.0
+        colocated = self.n_runs() * (mean_solo + setup)
+        baselines = len(names) * self.reps * 6 * (mean_solo + setup)  # ~6 sessions
+        return (colocated + baselines) / 3600.0
+
+
+class BaselineCache:
+    """Per-session solo timings.
+
+    Keyed on (session_id, workload, rep) so a new session forces fresh
+    measurement. This is the guard against the most common way a cloud-based
+    measurement study produces meaningless slowdown ratios.
+    """
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self._solo: Dict[Tuple[str, int], float] = {}
+        self._sig: Dict[str, sig_mod.Signature] = {}
+
+    def solo(self, name: str, rep: int, device_index: int, interval_ms: int) -> float:
+        key = (name, rep)
+        if key not in self._solo:
+            res = runner_mod.run(registry.get(name), device_index=device_index,
+                                 interval_ms=interval_ms, seed=rep)
+            self._solo[key] = res.wall_seconds
+            self._sig.setdefault(name, res.signature)
+        return self._solo[key]
+
+    def signature(self, name: str) -> sig_mod.Signature:
+        if name not in self._sig:
+            self._sig[name] = runner_mod.run(registry.get(name), seed=0).signature
+        return self._sig[name]
+
+    def median_solo(self, name: str) -> float:
+        vals = [v for (n, _), v in self._solo.items() if n == name]
+        return float(np.median(vals)) if vals else float("nan")
+
+
+def _measure_pair_cuda(a: str, b: str, thread_a: int, thread_b: int,
+                       cfg: SweepConfig, status: mps_mod.MPSStatus,
+                       rep: int) -> Dict:
+    """Launch two worker processes that overlap, and collect their reports."""
+    tmp = Path(tempfile.mkdtemp(prefix="sagc-pair-"))
+    out_a, out_b = tmp / "a.json", tmp / "b.json"
+    start_at = time.time() + LAUNCH_LEAD_SECONDS
+
+    def launch(name: str, pct: int, out: Path):
+        cmd = [sys.executable, "-m", "sagc.m3_dataset.worker",
+               "--workload", name, "--device", "0", "--thread-pct", str(pct),
+               "--start-at", f"{start_at:.3f}", "--interval-ms", str(cfg.interval_ms),
+               "--seed", str(rep), "--out", str(out)]
+        e = {**os.environ, **mps_mod.client_env(pct, cfg.device_index, status)}
+        return subprocess.Popen(cmd, env=e, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+
+    pa, pb = launch(a, thread_a, out_a), launch(b, thread_b, out_b)
+    timeout = LAUNCH_LEAD_SECONDS + 600
+    try:
+        pa.wait(timeout=timeout)
+        pb.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        for p in (pa, pb):
+            p.kill()
+
+    def read(path: Path) -> Dict:
+        if path.exists():
+            try:
+                return json.loads(path.read_text())
+            except json.JSONDecodeError:
+                pass
+        return {"ok": False, "oom": False, "error": "worker produced no report",
+                "wall_seconds": None}
+
+    return {"a": read(out_a), "b": read(out_b)}
+
+
+def _measure_pair_sim(a: str, b: str, thread_a: int, thread_b: int,
+                      cfg: SweepConfig, rep: int) -> Dict:
+    sa, sb = registry.get(a), registry.get(b)
+    outcome = interference.predict_pair(sa, sb, thread_a, thread_b,
+                                        device_vram_mb=env.device_memory_mb(),
+                                        repetition=rep)
+    if outcome.oom:
+        return {"a": {"ok": False, "oom": True, "wall_seconds": None},
+                "b": {"ok": False, "oom": True, "wall_seconds": None},
+                "vram_required_mb": outcome.vram_required_mb}
+    ra = runner_mod.run(sa, interval_ms=cfg.interval_ms,
+                        slowdown=outcome.slowdown_a, seed=rep * 31 + 1)
+    rb = runner_mod.run(sb, interval_ms=cfg.interval_ms,
+                        slowdown=outcome.slowdown_b, seed=rep * 31 + 2)
+    return {"a": {"ok": True, "oom": False, "wall_seconds": ra.wall_seconds},
+            "b": {"ok": True, "oom": False, "wall_seconds": rb.wall_seconds},
+            "vram_required_mb": outcome.vram_required_mb}
+
+
+def run_sweep(cfg: Optional[SweepConfig] = None, verbose: bool = True,
+              progress_every: int = 20
+              ) -> Tuple[pd.DataFrame, provenance.Provenance]:
+    """Execute the full pairwise sweep and return the labelled dataset."""
+    cfg = cfg or SweepConfig()
+    caps = env.detect()
+    status = mps_mod.start()
+    device_vram = env.device_memory_mb()
+
+    if verbose:
+        print(mps_mod.report(status))
+        print(f"pairs={len(cfg.pairs())} thread_pcts={cfg.thread_pcts} reps={cfg.reps}")
+        print(f"total co-located runs = {cfg.n_runs()}")
+        print(f"estimated budget      = {cfg.estimate_gpu_hours():.1f} GPU-hours")
+        print()
+
+    if status.mode == mps_mod.MODE_CONCURRENT and len(cfg.thread_pcts) > 1:
+        if verbose:
+            print("MPS partition control unavailable; collapsing thread-pct sweep to [100]")
+        cfg.thread_pcts = [100]
+
+    cache = BaselineCache(cfg.session_id)
+    rows: List[dict] = []
+    t_start = time.time()
+    done = 0
+
+    try:
+        for (a, b) in cfg.pairs():
+            for pct in cfg.thread_pcts:
+                for rep in range(cfg.reps):
+                    solo_a = cache.solo(a, rep, cfg.device_index, cfg.interval_ms)
+                    solo_b = cache.solo(b, rep, cfg.device_index, cfg.interval_ms)
+
+                    meas = (_measure_pair_cuda(a, b, pct, pct, cfg, status, rep)
+                            if caps.backend == env.BACKEND_CUDA
+                            else _measure_pair_sim(a, b, pct, pct, cfg, rep))
+
+                    ra, rb = meas["a"], meas["b"]
+                    oom = bool(ra.get("oom") or rb.get("oom"))
+                    vram_sum = registry.get(a).sim_vram_mb + registry.get(b).sim_vram_mb
+
+                    if oom:
+                        slow_a = slow_b = np.nan
+                    else:
+                        wa, wb = ra.get("wall_seconds"), rb.get("wall_seconds")
+                        slow_a = (wa / solo_a) if (wa and solo_a) else np.nan
+                        slow_b = (wb / solo_b) if (wb and solo_b) else np.nan
+
+                    base = {"session_id": cfg.session_id, "rep": rep,
+                            "thread_pct_a": pct, "thread_pct_b": pct, "oom": oom,
+                            "vram_sum_mb": vram_sum,
+                            "vram_headroom_mb": device_vram - vram_sum,
+                            "device_vram_mb": device_vram,
+                            "colocation_mode": status.mode}
+                    # two rows per measurement: (target=a, other=b) and the swap
+                    rows.append({**base, "workload_a": a, "workload_b": b,
+                                 "solo_seconds_a": solo_a, "solo_seconds_b": solo_b,
+                                 "colocated_seconds_a": ra.get("wall_seconds"),
+                                 "colocated_seconds_b": rb.get("wall_seconds"),
+                                 "slowdown_a": slow_a, "slowdown_b": slow_b,
+                                 "role": "ab"})
+                    rows.append({**base, "workload_a": b, "workload_b": a,
+                                 "solo_seconds_a": solo_b, "solo_seconds_b": solo_a,
+                                 "colocated_seconds_a": rb.get("wall_seconds"),
+                                 "colocated_seconds_b": ra.get("wall_seconds"),
+                                 "slowdown_a": slow_b, "slowdown_b": slow_a,
+                                 "role": "ba"})
+                    done += 1
+                    if verbose and done % progress_every == 0:
+                        el = time.time() - t_start
+                        rate = done / max(el, 1e-6)
+                        eta = (cfg.n_runs() - done) / max(rate, 1e-9)
+                        state = "OOM" if oom else f"{slow_a:.2f}/{slow_b:.2f}"
+                        print(f"  {done:5d}/{cfg.n_runs()}  elapsed {el/60:5.1f}m  "
+                              f"eta {eta/60:5.1f}m  {a[:18]}+{b[:18]} {state}")
+    finally:
+        mps_mod.stop(status)
+
+    df = pd.DataFrame(rows)
+    prov = provenance.capture(module="M3", colocation_mode=status.mode,
+                              thread_pcts=cfg.thread_pcts, reps=cfg.reps,
+                              n_pairs=len(cfg.pairs()), session_id=cfg.session_id)
+    return provenance.stamp_dataframe(df, prov), prov
+
+
+def attach_signatures(df: pd.DataFrame, signatures: pd.DataFrame) -> pd.DataFrame:
+    """Join each row's tenant signatures on, producing the model's feature table."""
+    feats = sig_mod.FEATURE_NAMES + ["util_gpu_mean", "util_gpu_p95"]
+    sig = signatures.set_index("workload")
+    keep = [c for c in feats if c in sig.columns]
+    out = df.merge(sig[keep].add_prefix("a_"), left_on="workload_a",
+                   right_index=True, how="left")
+    out = out.merge(sig[keep].add_prefix("b_"), left_on="workload_b",
+                    right_index=True, how="left")
+    return out
+
+
+def save(df: pd.DataFrame, prov: provenance.Provenance,
+         path: str = "data/pairs.parquet") -> Path:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        df.to_parquet(p, index=False)
+    except Exception:  # noqa: BLE001
+        p = p.with_suffix(".csv")
+        df.to_csv(p, index=False)
+    prov.write(p.with_suffix(".provenance.json"))
+    return p
