@@ -6,6 +6,7 @@
     python -m sagc train          M4: fit the predictor, run ablations
     python -m sagc schedule       M5/M6: policy sweep and simulator validation
     python -m sagc figures        regenerate all eight figures
+    python -m sagc report         one-page results summary for the review
     python -m sagc all            the whole pipeline, in order
 
 Every stage writes its artefacts under data/ and reads the previous stage's
@@ -82,8 +83,13 @@ def cmd_profile(args) -> int:
 
     _banner(f"M2  PROFILE THE ZOO  (reps={args.reps})")
     t0 = time.time()
+    names = ([w.strip() for w in args.workloads.split(",") if w.strip()]
+             if args.workloads else None)
+    if names:
+        print(f"SUBSET RUN: {len(names)} workloads only. Smoke test, not the full zoo.")
     results = runner.profile_zoo(reps=args.reps, device_index=args.device,
-                                 interval_ms=args.interval_ms, verbose=True)
+                                 interval_ms=args.interval_ms, names=names,
+                                 verbose=True)
     sigs = sig_mod.signatures_to_frame([r.signature for r in results])
     num = list(sigs.select_dtypes("number").columns)
     agg = sigs.groupby("workload")[num].median().reset_index()
@@ -107,9 +113,15 @@ def cmd_sweep(args) -> int:
     from .m3_dataset import pairgen
 
     _banner(f"M3  PAIRWISE CO-LOCATION SWEEP  (reps={args.reps})")
+    workloads = ([w.strip() for w in args.workloads.split(",") if w.strip()]
+                 if args.workloads else None)
     cfg = pairgen.SweepConfig(reps=args.reps,
                               thread_pcts=[int(x) for x in args.thread_pcts.split(",")],
-                              device_index=args.device, interval_ms=args.interval_ms)
+                              device_index=args.device, interval_ms=args.interval_ms,
+                              workloads=workloads)
+    if workloads:
+        print(f"SUBSET RUN: {len(workloads)} workloads only. This is a smoke test, "
+              f"not the full sweep.")
     t0 = time.time()
     df, prov = pairgen.run_sweep(cfg, verbose=True)
     joined = pairgen.attach_signatures(df, _read(DATA / "signatures.parquet"))
@@ -273,8 +285,21 @@ def cmd_figures(args) -> int:
     return 0
 
 
+def cmd_report(args) -> int:
+    from . import report
+
+    _banner("RESULTS SUMMARY")
+    out = report.build()
+    print(f"wrote {out}")
+    print()
+    print(out.read_text()[:1200])
+    print("...")
+    return 0
+
+
 def cmd_all(args) -> int:
-    for fn in (cmd_probe, cmd_profile, cmd_sweep, cmd_train, cmd_schedule, cmd_figures):
+    for fn in (cmd_probe, cmd_profile, cmd_sweep, cmd_train, cmd_schedule,
+               cmd_figures, cmd_report):
         rc = fn(args)
         if rc != 0:
             return rc
@@ -291,6 +316,9 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--device", type=int, default=0)
     common.add_argument("--interval-ms", type=int, default=100)
     common.add_argument("--thread-pcts", default="100,50")
+    common.add_argument("--workloads", default=None,
+                        help="comma-separated subset for a smoke test, e.g. "
+                             "esm2_35m_infer,mlp_admet_infer,resnet50_train_b32")
     common.add_argument("--model", default="lgbm")
     common.add_argument("--pipelines", type=int, default=20)
     common.add_argument("--skip-ablations", action="store_true")
@@ -306,7 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name, fn in [("probe", cmd_probe), ("profile", cmd_profile),
                      ("sweep", cmd_sweep), ("train", cmd_train),
                      ("schedule", cmd_schedule), ("figures", cmd_figures),
-                     ("all", cmd_all)]:
+                     ("report", cmd_report), ("all", cmd_all)]:
         sub.add_parser(name, parents=[common]).set_defaults(func=fn)
     return ap
 
