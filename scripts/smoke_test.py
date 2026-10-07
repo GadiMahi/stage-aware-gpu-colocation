@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import glob
 import json
+import os
 import subprocess
 import sys
 import time
@@ -27,11 +28,19 @@ FATAL = "fatal"
 WARN = "warn"
 
 
-def _run(args: list[str], timeout: int = 2400) -> tuple[int, str]:
+def _run(args: list[str], timeout: int = 2400,
+         env_extra: dict[str, str] | None = None) -> tuple[int, str]:
     t0 = time.time()
     print(f"\n$ {' '.join(args)}", flush=True)
-    p = subprocess.run(args, cwd=REPO, capture_output=True, text=True,
-                       timeout=timeout)
+    env = dict(os.environ)
+    if env_extra:
+        env.update(env_extra)
+    try:
+        p = subprocess.run(args, cwd=REPO, capture_output=True, text=True,
+                           timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        print(f"[TIMED OUT after {timeout}s]", flush=True)
+        return 124, f"timed out after {timeout}s"
     out = (p.stdout or "") + (p.stderr or "")
     print(out[-4000:], flush=True)
     print(f"[{time.time() - t0:.0f}s, exit {p.returncode}]", flush=True)
@@ -68,8 +77,14 @@ def main() -> int:
            f"mode={mode}; without mps, use --thread-pcts 100 and A6 is unavailable")
 
     # ---- tests -------------------------------------------------------------
-    rc, out = _run([sys.executable, "-m", "pytest", "tests/", "-q"], timeout=1200)
-    record("test suite passes", FATAL, rc == 0, f"exit {rc}")
+    # The suite is logic-only and is pinned to the simulated backend by
+    # tests/conftest.py. Pinned again here so an older checkout of that file
+    # cannot quietly turn pytest into a billed GPU campaign.
+    rc, out = _run([sys.executable, "-m", "pytest", "tests/", "-q"],
+                   timeout=600, env_extra={"SAGC_BACKEND": "sim"})
+    record("test suite passes", FATAL, rc == 0,
+           f"exit {rc}" + (" (timed out; the suite must not touch the GPU)"
+                           if rc == 124 else ""))
 
     # ---- the pipeline, on a subset -----------------------------------------
     rc, out = _run([sys.executable, "-m", "sagc", "profile", "--reps", "2",
