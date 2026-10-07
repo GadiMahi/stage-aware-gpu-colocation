@@ -19,7 +19,7 @@ This repository measures the interference instead of deriving it, learns a model
 predicts it for pairings never run, and uses that model as the cost function of a
 scheduler that shares a device only when it predicts it is safe.
 
-**The contribution is not "learn interference from measurement"** — Bubble-Up did that in
+**The contribution is not "learn interference from measurement".** Bubble-Up did that in
 2011 and Prophet did it for GPUs in 2017. It is that prediction happens at
 *pipeline-stage* granularity, and that because a scientific campaign runs the same stages
 thousands of times, a stage can be profiled once and reused forever. Every prior system
@@ -94,11 +94,11 @@ full pipeline with checkpointing. Expect roughly seven GPU-hours for the complet
 
 Counter availability varies by machine, so M2 degrades explicitly rather than silently:
 
-1. **DCGM** (`dcgmi dmon`) — fields 1001/1002/1003/1005. The only source that reports true
+1. **DCGM** (`dcgmi dmon`), fields 1001/1002/1003/1005. The only source that reports true
    achieved occupancy. This is what you want.
-2. **pynvml** — utilisation only. Occupancy is recorded as *missing*, never guessed. The
+2. **pynvml**, utilisation only. Occupancy is recorded as *missing*, never guessed. The
    counters-versus-utilisation ablation cannot be run at this tier.
-3. **simulated** — no GPU.
+3. **simulated**, no GPU.
 
 `python -m sagc probe` tells you which tier you are on and what it costs you.
 
@@ -200,6 +200,6 @@ python -m pytest tests/ -q
 
 Python 3.10+. `numpy pandas scikit-learn lightgbm matplotlib pyarrow pulp`. On a GPU
 machine additionally `torch`, and optionally `transformers timm torch_geometric rdkit
-pynvml` — every one of those has a pure-PyTorch fallback, so a hub outage or a disabled
+pynvml`. Every one of those has a pure-PyTorch fallback, so a hub outage or a disabled
 internet toggle cannot destroy a measurement campaign. Fallback use is recorded in the run
 manifest as `impl="fallback"` and never silently conflated with the real model.

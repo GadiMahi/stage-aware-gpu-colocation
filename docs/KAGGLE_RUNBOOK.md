@@ -18,11 +18,11 @@ batch job**, not babysat in a browser tab. That is Phase 2.
 
 ---
 
-## Phase 0 — set the notebook up (5 minutes)
+## Phase 0: set the notebook up (5 minutes)
 
 1. kaggle.com → **Create → New Notebook**
 2. Right-hand panel → **Settings**:
-   - **Accelerator: GPU T4 x2** (not P100, not a single T4 — the project schedules across
+   - **Accelerator: GPU T4 x2** (not P100, not a single T4, because the project schedules across
      two devices)
    - **Internet: On** (only needed to clone and pip install; the workloads themselves all
      have offline fallbacks)
@@ -39,7 +39,7 @@ If the repo is private, use a token URL instead and delete it before sharing the
 
 ---
 
-## Phase 1 — the go/no-go run (30 minutes, ~0.4 GPU-hours)
+## Phase 1: the go/no-go run (30 minutes, ~0.4 GPU-hours)
 
 **Run this before the full sweep. Every time.** It costs almost nothing and tells you
 whether the expensive run will produce anything usable.
@@ -93,12 +93,12 @@ If none of that works, you have two honest options, and you should pick one deli
 rather than drift:
 
 1. **Run at the pynvml tier anyway.** You get real slowdown measurements (which is the
-   dataset, the model and the scheduler — most of the project). You lose ablation A1. Say
+   dataset, the model and the scheduler, which is most of the project). You lose ablation A1. Say
    so plainly in the review: *"achieved occupancy counters were not available in this
    environment, so the counters-versus-utilisation ablation is reported from simulation
    and flagged as such."* The generated `RESULTS.md` prints this caveat for you.
-2. **Get an hour on a machine where DCGM works** — your department's server, or Colab with
-   a runtime that permits it — and run the profile stage there just for the signatures.
+2. **Get an hour on a machine where DCGM works.** Your department's server, or Colab with
+   a runtime that permits it. Run the profile stage there just for the signatures.
 
 Either is defensible. Pretending you had occupancy data when you did not is not.
 
@@ -112,7 +112,7 @@ Either is defensible. Pretending you had occupancy data when you did not is not.
 
 ---
 
-## Phase 2 — the full campaign (~5 GPU-hours, unattended)
+## Phase 2: the full campaign (~5 GPU-hours, unattended)
 
 Do **not** run this interactively. Use Kaggle's batch mode so it survives you closing the
 laptop.
@@ -139,7 +139,7 @@ from `data/`, so restart from the first stage that did not complete:
 
 ---
 
-## Phase 3 — the hardware campaign (~30 minutes)
+## Phase 3: the hardware campaign (~30 minutes)
 
 Cell 9 runs a real campaign under exclusive allocation. **This is Objective 1**: the
 measured held-but-idle fraction that motivates the entire project.
@@ -150,9 +150,9 @@ report can pick it up.
 
 ---
 
-## Phase 4 — collect what you need (10 minutes)
+## Phase 4: collect what you need (10 minutes)
 
-Cell 12 generates `results/RESULTS.md` — a single page with the provenance banner, the
+Cell 12 generates `results/RESULTS.md`, a single page with the provenance banner, the
 environment, module-by-module completion against each stated criterion, the headline
 numbers, every ablation table, and an explicit list of what is still missing. It is
 generated, never typed, so it cannot drift from the data.
@@ -183,21 +183,21 @@ particular ones kept.)
 
 ---
 
-## Phase 5 — record the demo (20 minutes)
+## Phase 5: record the demo (20 minutes)
 
 Module Completion is worth 4 marks at Review 2 and the word is *completion*: they want to
 see it run, not hear that it ran.
 
 **Record a 90-second screen capture, in advance.** Never demo live off a Kaggle session
-in front of a panel — the session will pick that moment to time out.
+in front of a panel, because the session will pick that moment to time out.
 
 Show, in this order:
 
-1. `python -m sagc probe` — 10 seconds. Establishes this is real hardware.
-2. `python -m pytest tests/ -q` — 10 seconds. 31 passing tests.
+1. `python -m sagc probe`. 10 seconds. Establishes this is real hardware.
+2. `python -m pytest tests/ -q`. 10 seconds. 33 passing tests.
 3. A few seconds of the sweep running, with the progress line ticking.
-4. `python -m sagc train` — the leave-one-workload-out MAE appearing.
-5. `python -m sagc schedule` — the policy sweep table and the headline line.
+4. `python -m sagc train`. The leave-one-workload-out MAE appearing.
+5. `python -m sagc schedule`. The policy sweep table and the headline line.
 6. Scroll through `figures/` showing F1, F5 and F7.
 
 Speed up the boring parts in any video editor, or just cut between them. OBS Studio, the

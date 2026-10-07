@@ -159,7 +159,7 @@ suspiciously clean sweep.
 
 | Item | Status | Needed for |
 |---|---|---|
-| Hardware measurement of everything | **not started** — needs the Kaggle run | every citable number |
+| Hardware measurement of everything | **not started**, needs the Kaggle run | every citable number |
 | A5 cross-architecture ablation | reports "not available" by design | needs a second GPU generation (Colab L4) |
 | Multi-tenant beyond pairs | approximated by aggregating co-tenant pressure | 3-way residency is out of scope |
 | ILP bound | single-epoch only | stated as such; not a campaign-level claim |
