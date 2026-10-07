@@ -169,6 +169,23 @@ def cmd_sweep(args) -> int:
     print(f"slowdown: median {clean['slowdown_a'].median():.3f}  "
           f"p95 {clean['slowdown_a'].quantile(0.95):.3f}  "
           f"max {clean['slowdown_a'].max():.3f}")
+
+    # Sharing a device cannot make a workload faster. A slowdown below 1 means
+    # the baseline and the co-located run were not measured under the same
+    # conditions, which silently corrupts every ratio in the dataset, so it is
+    # reported here rather than left for someone to notice in a figure.
+    impossible = clean[clean["slowdown_a"] < 0.97]
+    if len(impossible):
+        frac = len(impossible) / max(len(clean), 1)
+        print()
+        print(f"WARNING: {len(impossible)} of {len(clean)} rows ({frac:.1%}) have "
+              f"slowdown below 0.97, which is physically impossible under "
+              f"contention.")
+        print("  The solo baseline is not comparable with the co-located run. "
+              "Do not report these ratios.")
+        worst = impossible.nsmallest(5, "slowdown_a")[
+            ["workload_a", "workload_b", "thread_pct_a", "slowdown_a"]]
+        print(worst.to_string(index=False))
     return 0
 
 

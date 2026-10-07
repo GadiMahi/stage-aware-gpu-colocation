@@ -84,18 +84,38 @@ class BaselineCache:
     measurement study produces meaningless slowdown ratios.
     """
 
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, cfg=None, status=None, backend: str = ""):
         self.session_id = session_id
+        self.cfg = cfg
+        self.status = status
+        self.backend = backend
         self._solo: Dict[Tuple[str, int], float] = {}
         self._sig: Dict[str, sig_mod.Signature] = {}
 
     def solo(self, name: str, rep: int, device_index: int, interval_ms: int) -> float:
+        """Solo wall time, measured the same way the co-located run will be.
+
+        On hardware the baseline is a worker subprocess running alone at a 100%
+        thread partition, not an in-process call. Anything else makes the ratio
+        measure the difference between two execution paths on top of the
+        interference it is supposed to isolate.
+        """
         key = (name, rep)
-        if key not in self._solo:
-            res = runner_mod.run(registry.get(name), device_index=device_index,
-                                 interval_ms=interval_ms, seed=rep)
-            self._solo[key] = res.wall_seconds
-            self._sig.setdefault(name, res.signature)
+        if key in self._solo:
+            return self._solo[key]
+
+        if self.backend == env.BACKEND_CUDA and self.cfg is not None:
+            rep_out = _measure_solo_cuda(name, 100, self.cfg, self.status, rep)
+            wall = rep_out.get("wall_seconds")
+            if wall:
+                self._solo[key] = float(wall)
+                return self._solo[key]
+            # worker failed; fall through so the sweep still produces a row
+
+        res = runner_mod.run(registry.get(name), device_index=device_index,
+                             interval_ms=interval_ms, seed=rep)
+        self._solo[key] = res.wall_seconds
+        self._sig.setdefault(name, res.signature)
         return self._solo[key]
 
     def signature(self, name: str) -> sig_mod.Signature:
@@ -108,6 +128,52 @@ class BaselineCache:
         return float(np.median(vals)) if vals else float("nan")
 
 
+def _launch_worker(name: str, pct: int, out: Path, start_at: float,
+                   cfg: SweepConfig, status: mps_mod.MPSStatus, rep: int):
+    """Spawn one tenant. The ONLY way a timing is ever produced.
+
+    Solo baselines and co-located runs must come from an identical execution
+    path, or the ratio between them measures the path difference as well as the
+    interference. Running the baseline in the sweep's own process did exactly
+    that: the parent is not an MPS client, so it pays full kernel-launch
+    overhead, while a worker goes through the MPS daemon and pays less. On a
+    launch-bound workload such as gin_small_infer, 59k kernels of ~0.34 ms, that
+    alone made the co-located run FASTER than its own baseline and produced
+    slowdowns below 1.0, which is physically impossible under contention.
+    """
+    cmd = [sys.executable, "-m", "sagc.m3_dataset.worker",
+           "--workload", name, "--device", "0", "--thread-pct", str(pct),
+           "--start-at", f"{start_at:.3f}", "--interval-ms", str(cfg.interval_ms),
+           "--seed", str(rep), "--out", str(out)]
+    e = {**os.environ, **mps_mod.client_env(pct, cfg.device_index, status)}
+    return subprocess.Popen(cmd, env=e, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+
+
+def _read_report(path: Path) -> Dict:
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except json.JSONDecodeError:
+            pass
+    return {"ok": False, "oom": False, "error": "worker produced no report",
+            "wall_seconds": None}
+
+
+def _measure_solo_cuda(name: str, pct: int, cfg: SweepConfig,
+                       status: mps_mod.MPSStatus, rep: int) -> Dict:
+    """One tenant alone, through the same worker path a co-located run uses."""
+    tmp = Path(tempfile.mkdtemp(prefix="sagc-solo-"))
+    out = tmp / "solo.json"
+    start_at = time.time() + LAUNCH_LEAD_SECONDS
+    p = _launch_worker(name, pct, out, start_at, cfg, status, rep)
+    try:
+        p.wait(timeout=LAUNCH_LEAD_SECONDS + 600)
+    except subprocess.TimeoutExpired:
+        p.kill()
+    return _read_report(out)
+
+
 def _measure_pair_cuda(a: str, b: str, thread_a: int, thread_b: int,
                        cfg: SweepConfig, status: mps_mod.MPSStatus,
                        rep: int) -> Dict:
@@ -117,13 +183,7 @@ def _measure_pair_cuda(a: str, b: str, thread_a: int, thread_b: int,
     start_at = time.time() + LAUNCH_LEAD_SECONDS
 
     def launch(name: str, pct: int, out: Path):
-        cmd = [sys.executable, "-m", "sagc.m3_dataset.worker",
-               "--workload", name, "--device", "0", "--thread-pct", str(pct),
-               "--start-at", f"{start_at:.3f}", "--interval-ms", str(cfg.interval_ms),
-               "--seed", str(rep), "--out", str(out)]
-        e = {**os.environ, **mps_mod.client_env(pct, cfg.device_index, status)}
-        return subprocess.Popen(cmd, env=e, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True)
+        return _launch_worker(name, pct, out, start_at, cfg, status, rep)
 
     pa, pb = launch(a, thread_a, out_a), launch(b, thread_b, out_b)
     timeout = LAUNCH_LEAD_SECONDS + 600
@@ -134,16 +194,7 @@ def _measure_pair_cuda(a: str, b: str, thread_a: int, thread_b: int,
         for p in (pa, pb):
             p.kill()
 
-    def read(path: Path) -> Dict:
-        if path.exists():
-            try:
-                return json.loads(path.read_text())
-            except json.JSONDecodeError:
-                pass
-        return {"ok": False, "oom": False, "error": "worker produced no report",
-                "wall_seconds": None}
-
-    return {"a": read(out_a), "b": read(out_b)}
+    return {"a": _read_report(out_a), "b": _read_report(out_b)}
 
 
 def _measure_pair_sim(a: str, b: str, thread_a: int, thread_b: int,
@@ -227,7 +278,8 @@ def run_sweep(cfg: Optional[SweepConfig] = None, verbose: bool = True,
             print("MPS partition control unavailable; collapsing thread-pct sweep to [100]")
         cfg.thread_pcts = [100]
 
-    cache = BaselineCache(cfg.session_id)
+    cache = BaselineCache(cfg.session_id, cfg=cfg, status=status,
+                          backend=caps.backend)
     # Resume support. The sweep is hours long and a session that dies at hour
     # four with everything still in memory loses every measurement, so each
     # measurement is appended to a JSONL checkpoint as soon as it is taken and
