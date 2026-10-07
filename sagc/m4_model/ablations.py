@@ -39,20 +39,48 @@ class AblationResult:
 
 def a1_feature_set(df: pd.DataFrame, model_kind: str = "lgbm",
                    seed: int = 0) -> AblationResult:
-    """Does the counter signature actually beat the utilisation number?"""
+    """Does the counter signature actually beat the utilisation number?
+
+    The comparison is only as strong as the signature the environment could
+    measure. Where achieved occupancy was unavailable (the pynvml tier), this
+    ablation still runs, because the remaining counter features carry real
+    information the utilisation baseline does not have: DRAM-controller activity
+    and the torch-profiler kernel statistics. It is then a REDUCED A1 and says
+    so, naming the features it had to leave out. Reporting a reduced comparison
+    as the full one would be the dishonest option; declining to run it at all
+    would throw away a result that is genuinely available.
+    """
     rows = []
     for kind in (train.FEATURESET_UTILISATION, train.FEATURESET_COUNTERS,
                  train.FEATURESET_BOTH):
         cv = train.leave_one_workload_out(df, kind, model_kind, seed)
+        declared = train.feature_columns(kind)
+        dropped = set(train.unpopulated_columns(df, kind))
         rows.append({"feature_set": kind, "mae": cv.mae, "rmse": cv.rmse,
                      "r2": cv.r2, "n_test": cv.n_test,
-                     "n_features": len(train.feature_columns(kind))})
+                     "n_features": len([c for c in declared if c not in dropped]),
+                     "n_features_declared": len(declared),
+                     "n_features_unmeasured": len(dropped)})
     tab = pd.DataFrame(rows)
     base = tab.loc[tab.feature_set == train.FEATURESET_UTILISATION, "mae"]
     if not base.empty and base.iloc[0] > 0:
         tab["mae_vs_utilisation"] = tab["mae"] / base.iloc[0]
-    return AblationResult("A1 feature set", tab,
-                          note="leave-one-workload-out error by feature set")
+
+    unmeasured = train.unpopulated_columns(df, train.FEATURESET_COUNTERS)
+    occupancy_missing = any("sm_occupancy" in c for c in unmeasured)
+    if occupancy_missing:
+        note = ("REDUCED: achieved occupancy was not measurable in this "
+                "environment, so the counter signature here excludes "
+                + ", ".join(sorted({c.split("_", 1)[1] for c in unmeasured}))
+                + ". The comparison still runs on the remaining counter "
+                  "features (DRAM activity, kernel statistics, transfer "
+                  "volume) against coarse utilisation.")
+    elif unmeasured:
+        note = ("REDUCED: " + str(len(unmeasured)) + " declared features were "
+                "not measurable and are excluded.")
+    else:
+        note = "leave-one-workload-out error by feature set"
+    return AblationResult("A1 feature set", tab, note=note)
 
 
 def a2_model_class(df: pd.DataFrame, kind: str = train.FEATURESET_COUNTERS,

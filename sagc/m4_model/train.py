@@ -62,6 +62,25 @@ def feature_columns(kind: str = FEATURESET_COUNTERS) -> List[str]:
     return [f"a_{f}" for f in base] + [f"b_{f}" for f in base] + _CONFIG_FEATURES
 
 
+def unpopulated_columns(df: pd.DataFrame,
+                        kind: str = FEATURESET_COUNTERS) -> List[str]:
+    """Feature columns that exist but hold no value at all.
+
+    This is not a defensive nicety, it is a correctness requirement. At the
+    pynvml profiler tier `sm_occupancy` is recorded as missing rather than
+    synthesised, so its three derived features arrive as entirely NaN columns.
+    LightGBM accepts an all-NaN feature without complaint and simply never
+    splits on it, which means an ablation comparing the counter signature
+    against coarse utilisation would silently be run on a signature missing its
+    most important member, and would be reported as though occupancy had been
+    measured. Columns with nothing in them are therefore dropped and named, so
+    the caller can say which signature it actually trained on.
+    """
+    present = [c for c in feature_columns(kind) if c in df.columns]
+    return [c for c in present
+            if not pd.to_numeric(df[c], errors="coerce").notna().any()]
+
+
 def prepare(df: pd.DataFrame, kind: str = FEATURESET_COUNTERS,
             drop_oom: bool = True) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
     """Feature matrix, target, and column list from the joined pair dataset."""
@@ -73,6 +92,13 @@ def prepare(df: pd.DataFrame, kind: str = FEATURESET_COUNTERS,
     missing = [c for c in feature_columns(kind) if c not in work.columns]
     if missing:
         warnings.warn(f"{len(missing)} feature columns absent and skipped: {missing[:4]}")
+    empty = unpopulated_columns(work, kind)
+    if empty:
+        warnings.warn(
+            f"{len(empty)} feature columns are entirely missing in this dataset "
+            f"and were dropped: {empty[:4]}. The profiler tier that produced it "
+            f"could not measure them.")
+        cols = [c for c in cols if c not in set(empty)]
     return work[cols].astype(float), work[TARGET].astype(float), cols
 
 

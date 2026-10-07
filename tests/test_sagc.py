@@ -291,3 +291,45 @@ def test_capture_matches_backend():
     expected = (provenance.SIMULATED if env.detect().backend == env.BACKEND_SIM
                 else provenance.MEASURED)
     assert prov.kind == expected
+
+
+def test_all_nan_feature_columns_are_dropped_not_silently_trained_on(small_dataset):
+    """At the pynvml tier sm_occupancy is NaN. It must not reach the model.
+
+    An all-NaN feature is accepted by LightGBM without error and never split
+    on, so without this the counters-vs-utilisation ablation would quietly be
+    run on a signature missing achieved occupancy while still being reported as
+    though occupancy had been measured.
+    """
+    import numpy as np
+    from sagc.m4_model import train as t
+
+    df = small_dataset[0].copy()
+    occ = [c for c in t.feature_columns(t.FEATURESET_COUNTERS)
+           if "sm_occupancy" in c]
+    assert occ, "feature set does not expose occupancy features"
+    for c in occ:
+        df[c] = np.nan
+
+    assert set(t.unpopulated_columns(df, t.FEATURESET_COUNTERS)) == set(occ)
+    X, _y, cols = t.prepare(df, t.FEATURESET_COUNTERS)
+    assert not set(cols) & set(occ)
+    assert not set(X.columns) & set(occ)
+    assert cols, "dropping unmeasured columns must not empty the feature set"
+
+
+def test_a1_flags_itself_as_reduced_when_occupancy_is_unmeasurable(small_dataset):
+    import numpy as np
+    from sagc.m4_model import ablations, train as t
+
+    df = small_dataset[0].copy()
+    for c in t.feature_columns(t.FEATURESET_COUNTERS):
+        if "sm_occupancy" in c:
+            df[c] = np.nan
+
+    res = ablations.a1_feature_set(df)
+    assert "REDUCED" in res.note
+    assert "sm_occupancy" in res.note
+    row = res.table[res.table.feature_set == t.FEATURESET_COUNTERS].iloc[0]
+    assert row["n_features_unmeasured"] == 6
+    assert row["n_features"] < row["n_features_declared"]
