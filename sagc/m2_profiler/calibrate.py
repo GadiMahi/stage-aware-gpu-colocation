@@ -147,7 +147,8 @@ def save(table: Dict[str, dict], path: Path = CALIBRATION_PATH) -> Path:
     caps = env.detect()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "device": caps.gpu_names[0] if caps.gpu_names else "unknown",
+        "device": caps.gpus[0].name if caps.gpus else "unknown",
+        "n_devices": len(caps.gpus),
         "backend": caps.backend,
         "workloads": table,
     }
