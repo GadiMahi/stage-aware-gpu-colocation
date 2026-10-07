@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from ..common import env
+from . import calibrate
 from ..workloads import registry
 from . import sampler as sampler_mod
 from . import signature as sig_mod
@@ -115,7 +116,7 @@ def _run_cuda(spec, device_index: int, interval_ms: int,
                              env.BACKEND_CUDA, oom=True, error=str(exc)[:200])
         raise
 
-    n_iter = iterations if iterations is not None else spec.iterations
+    n_iter = calibrate.iterations_for(spec, iterations)
 
     try:
         for _ in range(spec.warmup):
@@ -220,7 +221,7 @@ def run(spec_or_name, device_index: int = 0,
         from ..workloads import torch_workloads
 
         runnable = torch_workloads.build(spec)
-        n_iter = iterations if iterations is not None else spec.iterations
+        n_iter = calibrate.iterations_for(spec, iterations)
         s = sampler_mod.make_sampler(spec, device_index, interval_ms)
         s.start()
         t0 = time.perf_counter()

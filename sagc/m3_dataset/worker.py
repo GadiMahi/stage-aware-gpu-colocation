@@ -38,6 +38,7 @@ def main(argv=None) -> int:
 
     from ..common import env
     from ..m2_profiler import runner, sampler as sampler_mod, signature as sig_mod
+    from ..m2_profiler import calibrate
     from ..workloads import registry
 
     spec = registry.get(args.workload)
@@ -65,7 +66,7 @@ def main(argv=None) -> int:
                 while time.time() < args.start_at:
                     time.sleep(0.001)
 
-            n_iter = args.iterations or spec.iterations
+            n_iter = calibrate.iterations_for(spec, args.iterations)
             s = sampler_mod.make_sampler(spec, 0, args.interval_ms)
             s.start()
             t0 = time.perf_counter()

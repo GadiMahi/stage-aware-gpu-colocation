@@ -44,7 +44,22 @@ If the repo is private, use a token URL instead and delete it before sharing the
 **Run this before the full sweep. Every time.** It costs almost nothing and tells you
 whether the expensive run will produce anything usable.
 
-Run cells 1, 2 and 3. Then run a deliberately tiny sweep:
+Run cells 1, 2 and 3. **Then calibrate**, which is not optional on a machine
+this code has not run on before:
+
+```python
+!python -m sagc calibrate
+```
+
+The iteration counts declared in the registry are estimates. On a real T4 they
+were wrong by up to a factor of twenty, which turns a five-hour campaign into a
+seventy-hour one. `calibrate` measures the per-iteration cost on the device in
+front of it and solves for the count that hits a 20 second solo run. It writes
+`data/calibration.json`, which every later stage reads. Run it once per machine,
+before any measurement, so that every solo run and every co-located run in the
+campaign does identical work.
+
+Then run a deliberately tiny sweep:
 
 ```python
 !python -m sagc profile --reps 2 --workloads esm2_35m_infer,mlp_admet_infer,resnet50_train_b32

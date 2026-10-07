@@ -77,6 +77,26 @@ def cmd_probe(args) -> int:
     return 0
 
 
+def cmd_calibrate(args) -> int:
+    """Solve for the iteration count that hits the target solo duration.
+
+    Must run before `profile` and `sweep` on any new machine. The declared
+    counts in the registry are estimates and were wrong by up to 20x on a T4.
+    """
+    from .m2_profiler import calibrate as cal
+
+    names = ([w.strip() for w in args.workloads.split(",") if w.strip()]
+             if args.workloads else None)
+    table = cal.calibrate(names, target_seconds=args.target_seconds,
+                          device_index=args.device)
+    if table:
+        path = cal.save(table)
+        print(f"\nwrote {path}")
+        print("profile and sweep will now use these counts; delete the file to "
+              "fall back to the declared ones")
+    return 0
+
+
 def cmd_profile(args) -> int:
     from .common import provenance
     from .m2_profiler import runner, signature as sig_mod
@@ -99,13 +119,26 @@ def cmd_profile(args) -> int:
     out = _write(provenance.stamp_dataframe(agg, prov), DATA / "signatures.parquet")
     prov.write(DATA / "signatures.provenance.json")
 
-    # run-to-run variance is the completion criterion for M2
-    var = (sigs.groupby("workload")["sm_occupancy_mean"]
-           .agg(["mean", "std"]).assign(cv=lambda d: d["std"] / d["mean"]))
+    # Run-to-run variance is the completion criterion for M2. Occupancy is the
+    # preferred basis, but it is unavailable below the dcgm tier, where it is
+    # recorded as NaN; reporting "max nan" would leave the criterion silently
+    # unevaluated, so fall back to a counter this machine actually measured and
+    # say which one was used.
+    criterion_col = next(
+        (c for c in ("sm_occupancy_mean", "sm_active_mean", "util_gpu_mean")
+         if c in sigs.columns and sigs[c].notna().any()), None)
     print()
     print(f"wrote {out}  ({len(agg)} workloads)  in {time.time()-t0:.1f}s")
-    print(f"occupancy coefficient of variation: max {var['cv'].max():.3f} "
-          f"(criterion: below 0.05)")
+    if criterion_col is None:
+        print("run-to-run variance: NOT EVALUABLE, no counter was measured")
+    else:
+        var = (sigs.groupby("workload")[criterion_col]
+               .agg(["mean", "std"]).assign(cv=lambda d: d["std"] / d["mean"]))
+        basis = criterion_col.replace("_mean", "")
+        note = "" if criterion_col == "sm_occupancy_mean" else \
+            "  (occupancy unavailable at this tier, substituted)"
+        print(f"{basis} coefficient of variation: max {var['cv'].max():.3f} "
+              f"(criterion: below 0.05){note}")
     return 0
 
 
@@ -298,7 +331,7 @@ def cmd_report(args) -> int:
 
 
 def cmd_all(args) -> int:
-    for fn in (cmd_probe, cmd_profile, cmd_sweep, cmd_train, cmd_schedule,
+    for fn in (cmd_probe, cmd_calibrate, cmd_profile, cmd_sweep, cmd_train, cmd_schedule,
                cmd_figures, cmd_report):
         rc = fn(args)
         if rc != 0:
@@ -322,6 +355,8 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--model", default="lgbm")
     common.add_argument("--pipelines", type=int, default=20)
     common.add_argument("--skip-ablations", action="store_true")
+    common.add_argument("--target-seconds", type=float, default=20.0,
+                        help="target solo wall time per workload for calibrate")
     common.add_argument("--skip-ilp", action="store_true")
     common.add_argument("--ilp-trials", type=int, default=6)
     common.add_argument("--bandit", action="store_true",
@@ -331,7 +366,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="sagc", parents=[common],
                                  description="Stage-aware GPU co-location")
     sub = ap.add_subparsers(dest="command", required=True)
-    for name, fn in [("probe", cmd_probe), ("profile", cmd_profile),
+    for name, fn in [("probe", cmd_probe), ("calibrate", cmd_calibrate),
+                     ("profile", cmd_profile),
                      ("sweep", cmd_sweep), ("train", cmd_train),
                      ("schedule", cmd_schedule), ("figures", cmd_figures),
                      ("report", cmd_report), ("all", cmd_all)]:
