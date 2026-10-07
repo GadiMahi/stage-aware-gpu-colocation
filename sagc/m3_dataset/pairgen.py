@@ -165,8 +165,49 @@ def _measure_pair_sim(a: str, b: str, thread_a: int, thread_b: int,
             "vram_required_mb": outcome.vram_required_mb}
 
 
+CHECKPOINT_PATH = Path("data/pairs.checkpoint.jsonl")
+
+
+def _load_checkpoint(path: Path, session_id: str) -> List[dict]:
+    """Rows from a previous attempt at THIS session, or an empty list.
+
+    Rows from a different session are discarded rather than reused: their solo
+    baselines were measured on a different process and machine state, so mixing
+    them would silently corrupt the slowdown ratios this whole project rests on.
+    """
+    try:
+        text = Path(path).read_text()
+    except Exception:  # noqa: BLE001
+        return []
+    out: List[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue          # a torn final line from a killed process
+        if rec.get("session_id") == session_id:
+            out.append(rec)
+    return out
+
+
+def _append_checkpoint(path: Path, new_rows: List[dict]) -> None:
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as fh:
+            for r in new_rows:
+                fh.write(json.dumps(r, default=str) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except Exception:  # noqa: BLE001
+        pass                  # checkpointing must never break the measurement
+
+
 def run_sweep(cfg: Optional[SweepConfig] = None, verbose: bool = True,
-              progress_every: int = 20
+              progress_every: int = 20,
+              checkpoint: Path = CHECKPOINT_PATH
               ) -> Tuple[pd.DataFrame, provenance.Provenance]:
     """Execute the full pairwise sweep and return the labelled dataset."""
     cfg = cfg or SweepConfig()
@@ -187,7 +228,23 @@ def run_sweep(cfg: Optional[SweepConfig] = None, verbose: bool = True,
         cfg.thread_pcts = [100]
 
     cache = BaselineCache(cfg.session_id)
-    rows: List[dict] = []
+    # Resume support. The sweep is hours long and a session that dies at hour
+    # four with everything still in memory loses every measurement, so each
+    # measurement is appended to a JSONL checkpoint as soon as it is taken and
+    # already-measured cells are skipped on a restart. The checkpoint is keyed
+    # on the session id as well as the cell, because a slowdown ratio is only
+    # comparable against a baseline measured in the same session.
+    rows: List[dict] = _load_checkpoint(checkpoint, cfg.session_id)
+    n_recovered = len(rows)
+    measured = {(r["workload_a"], r["workload_b"], r["thread_pct_a"], r["rep"])
+                for r in rows}
+    if rows and verbose:
+        print(f"RESUMING: {len(measured)} cells already measured, "
+              f"{len(rows)} rows recovered from {checkpoint}")
+    if verbose:
+        print(f"session id: {cfg.session_id}")
+        print(f"  to resume this sweep after a crash, re-run with "
+              f"--session-id {cfg.session_id}")
     t_start = time.time()
     done = 0
 
@@ -195,6 +252,9 @@ def run_sweep(cfg: Optional[SweepConfig] = None, verbose: bool = True,
         for (a, b) in cfg.pairs():
             for pct in cfg.thread_pcts:
                 for rep in range(cfg.reps):
+                    if (a, b, pct, rep) in measured:
+                        done += 1
+                        continue
                     solo_a = cache.solo(a, rep, cfg.device_index, cfg.interval_ms)
                     solo_b = cache.solo(b, rep, cfg.device_index, cfg.interval_ms)
 
@@ -232,6 +292,8 @@ def run_sweep(cfg: Optional[SweepConfig] = None, verbose: bool = True,
                                  "colocated_seconds_b": ra.get("wall_seconds"),
                                  "slowdown_a": slow_b, "slowdown_b": slow_a,
                                  "role": "ba"})
+                    _append_checkpoint(checkpoint, rows[-2:])
+                    measured.add((a, b, pct, rep))
                     done += 1
                     if verbose and done % progress_every == 0:
                         el = time.time() - t_start
@@ -244,9 +306,14 @@ def run_sweep(cfg: Optional[SweepConfig] = None, verbose: bool = True,
         mps_mod.stop(status)
 
     df = pd.DataFrame(rows)
+    # A resumed sweep was measured by more than one process. The solo baselines
+    # are re-measured in each process, so the dataset is not strictly
+    # single-session, and that must be recorded rather than quietly absorbed.
     prov = provenance.capture(module="M3", colocation_mode=status.mode,
                               thread_pcts=cfg.thread_pcts, reps=cfg.reps,
-                              n_pairs=len(cfg.pairs()), session_id=cfg.session_id)
+                              n_pairs=len(cfg.pairs()), session_id=cfg.session_id,
+                              resumed=bool(n_recovered),
+                              rows_recovered_from_checkpoint=n_recovered)
     return provenance.stamp_dataframe(df, prov), prov
 
 

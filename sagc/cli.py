@@ -148,7 +148,8 @@ def cmd_sweep(args) -> int:
     _banner(f"M3  PAIRWISE CO-LOCATION SWEEP  (reps={args.reps})")
     workloads = ([w.strip() for w in args.workloads.split(",") if w.strip()]
                  if args.workloads else None)
-    cfg = pairgen.SweepConfig(reps=args.reps,
+    cfg_kwargs = {"session_id": args.session_id} if args.session_id else {}
+    cfg = pairgen.SweepConfig(reps=args.reps, **cfg_kwargs,
                               thread_pcts=[int(x) for x in args.thread_pcts.split(",")],
                               device_index=args.device, interval_ms=args.interval_ms,
                               workloads=workloads)
@@ -355,6 +356,9 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--model", default="lgbm")
     common.add_argument("--pipelines", type=int, default=20)
     common.add_argument("--skip-ablations", action="store_true")
+    common.add_argument("--session-id", default=None,
+                        help="resume an interrupted sweep from its checkpoint; "
+                             "the sweep prints the id to use")
     common.add_argument("--target-seconds", type=float, default=20.0,
                         help="target solo wall time per workload for calibrate")
     common.add_argument("--skip-ilp", action="store_true")
